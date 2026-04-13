@@ -1,0 +1,511 @@
+---
+title: "Metabolic Distributions: isolate inequality"
+author: "Jay T. Lennon"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+header-includes:
+   - \usepackage{array}
+output: pdf_document
+geometry: margin=2.54cm
+---
+
+Characterizing distribution of metabolic activity among lake bacterial isolates
+
+## Clear workspace and set directory
+
+```{r setup}
+rm(list=ls())
+getwd()
+setwd("~/GitHub/MetabolicDistribution/")
+```
+
+## Load packages and functions
+
+```{r}
+need <- function(pkgs) pkgs[!sapply(pkgs, requireNamespace, quietly = TRUE)]
+
+bioc_pkgs <- c("Biostrings", "msa")
+cran_pkgs <- c(
+  "png", "dplyr", "grid", "psych", "seqinr", "ape", "phylobase",
+  "RColorBrewer", "phytools", "geiger", "picante", "lme4",
+  "lmerTest", "adephylo", "bios2mds"
+)
+
+# BiocManager if needed
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+# Install missing Bioconductor packages
+to_install_bioc <- need(bioc_pkgs)
+if (length(to_install_bioc))
+  BiocManager::install(to_install_bioc, ask = FALSE, update = TRUE)
+
+# Install missing CRAN packages
+to_install_cran <- need(cran_pkgs)
+if (length(to_install_cran))
+  install.packages(to_install_cran)
+
+# Load everything (quietly)
+all_pkgs <- c(cran_pkgs, bioc_pkgs)
+invisible(lapply(all_pkgs, function(p)
+  suppressPackageStartupMessages(library(p, character.only = TRUE))
+))
+
+# Your functions
+source("~/GitHub/MetabolicDistribution/bin/Phylo4D.JTL.R")
+# SEM
+sem <- function(x) {
+  sd(x, na.rm = TRUE) / sqrt(sum(!is.na(x)))
+}
+
+# Confidence Hulls
+add.hull <- function(model = "", pred.frame = ""){
+  CI.U <- predict(model, interval = "c", newdata=pred.frame)[, "upr"]
+  CI.L <- predict(model, interval = "c", newdata=pred.frame)[, "lwr"]
+  pred.frame2 <- unlist(pred.frame)
+  X.Vec <- c(pred.frame2, tail(pred.frame2, 1), rev(pred.frame2),
+               head(pred.frame2, 1))
+  Y.Vec <- c(CI.U, tail(CI.L, 1), rev(CI.L), head(CI.U,1))
+  polygon(X.Vec, Y.Vec, col = "gray90", border = NA)
+}
+```
+
+## Preparing sequence reads
+
+```{bash, results = 'hide', eval = FALSE}
+# Data wrangling:
+# step 1. For UL strains, we sequenced forward and reverse direction for long coverage
+# step 2. We used two fasta files (forward and reverse) with same id names
+# step 3. We reversed the reverse reads as follows:
+# seqkit seq -t dna -r -p IUB_reverse.fasta > IUB_reverse.rc.fasta
+# step 4. We then merged sequences
+# step 5. We created a new fasta file with merged UL reads and previous KBS reads
+
+# Sequence alignment:
+# step 1: brew install mafft
+# step 2: run at terminal: mafft --globalpair --maxiterate 1000 IUB_KBS.fasta > aligned.16S.highacc.fasta
+# High-accuracy mode (useful for rRNA fragments / small datasets)
+# --globalpair --maxiterate 1000 uses an accurate global alignment strategy
+
+# Maximum likelihood tree using RAxML-NG (v1.2) from Terminal
+# GTR + Gamma model: full ML + nonparametric bootstrap run, support mapping
+# ~/desktop % seqkit stats aligned.16S.highacc.fasta                
+# file                       format  type  num_seqs  sum_len  min_len  avg_len  max_len
+# aligned.16S.highacc.fasta  FASTA   DNA         24   36,096    1,504    1,504    1,504
+# confirm no weird characters: grep -v "^>" aligned.16S.fasta | tr -d '\n' | grep -o '[^ACGTN\-]' | sort -u
+# Trim poorly aligned seqs:
+# trimal -in aligned.16S.highacc.fasta \
+       #-out aligned.16S.highacc.fasta.trimmed.fasta \
+       #-automated1
+# Run RAxML: 
+# Thorough ML search (multiple starting trees)
+# Non-parametric bootstrap (100–500 replicates)
+# Support mapping onto best ML tree
+
+#raxml-ng \
+  #--msa aligned.16S.highacc.fasta.trimmed.fasta \
+  #--model GTR+G \ # GTR substitution model + Gamma rate heterogeneity
+  #--prefix 16S_GTRG \ # Output file prefix
+  #--threads 4 \
+  #--seed 12345 \
+  #--all \ # ML search + bootstrap + support mapping
+  #--bs-trees 200 \ # 200 bootstrap replicates
+  #--tree pars{10},rand{10} # 20 starting trees (very safe for small datasets)
+```
+
+## Visualize sequence alignment
+
+```{r}
+# Read aligned FASTA
+aln_path <- "data/isolates/aligned.16S.highacc.fasta" # or "analysis/aligned.trim.afa" if you trimmed
+dna <- read.dna(aln_path, format = "fasta")  # DNAbin matrix (rows = taxa, cols = sites)
+
+# Identify base pair region of 16S rRNA gene to visualize
+start <- 50
+end   <- 1200
+end   <- min(end, ncol(dna))  # clamp to alignment length
+if (start > ncol(dna)) stop("Start position is beyond alignment length.")
+window <- dna[, start:end, drop = FALSE]
+
+# Visualize the window
+par(mar = c(5, 5, 2, 1))
+image.DNAbin(window, cex.lab = 0.5)
+
+# existing KBS sequences are about 400 bp shorter than UL sequences
+```
+
+# View maximum likelihood tree
+
+```{r}
+# 1) Read the supported ML tree (single phylo with support values)
+tree <- read.tree("data/isolates/16S_GTRG.raxml.support")
+stopifnot(inherits(tree, "phylo"))
+
+# 2) Load map and prepare 'phytip'
+map <- read.csv("data/isolates/isolate.mapping.3.csv", stringsAsFactors = FALSE)
+stopifnot(all(c("ID","strain") %in% names(map)))
+map <- map %>%
+  mutate(
+    ID = as.character(ID),
+    strain = as.character(strain),
+    genus = as.character(genus),
+    phytip = trimws(paste(genus, strain))
+  )
+
+# 3) Sanity checks (short)
+missing_in_map <- setdiff(tree$tip.label, map$strain)   # compare to map$strain (IDs in tree are strains)
+dup_strain     <- map$strain[duplicated(map$strain)]
+
+if (length(missing_in_map) > 0) {
+  warning("Tips with no mapping (will be left as-is): ", paste(head(missing_in_map, 20), collapse = ", "))
+}
+if (length(dup_strain) > 0) {
+  warning("Duplicate entries in map$strain (ambiguous mapping): ", paste(unique(dup_strain), collapse = ", "))
+}
+
+# 4) Tiny relabeler (strain -> phytip). Works for phylo or multiPhylo; here tree is phylo
+ids  <- map$strain
+labs <- map$phytip
+i <- match(tree$tip.label, ids)
+tree$tip.label[!is.na(i)] <- labs[i[!is.na(i)]]
+cat("Relabeled:", sum(!is.na(i)), "tips\n")
+
+# 5) Root the tree on Methanosarcina (use exact matched label after relabeling)
+out <- grep("Methanosarc", tree$tip.label, value = TRUE)
+if (length(out) != 1) stop("Outgroup 'Methanosarcina' not found uniquely; got: ", paste(out, collapse = ", "))
+tree_rooted <- root(tree, outgroup = out, resolve.root = TRUE)
+
+# (optionally) save rooted tree
+write.tree(tree_rooted, file = "data/isolates/16S_GTRG.raxml.support.rooted.nwk")
+cat("Wrote rooted tree to data/16S_GTRG.raxml.support.rooted.nwk\n")
+
+# 6) Quick plots: 
+# 6a) simple vanilla check (rooted, shows outgroup)
+par(mfrow = c(1,1), mar = c(1,1,2,1) + 0.1)
+plot(tree_rooted, cex = 0.6, main = paste("Rooted on", out))
+if (!is.null(tree_rooted$node.label)) nodelabels(tree_rooted$node.label, cex = 0.5, frame = "n")
+
+# 6b) confirmation plot: drop the outgroup from the drawn figure for a cleaner view
+tree_for_plot <- drop.tip(tree_rooted, out)
+tree_for_plot <- ladderize(tree_for_plot, right = FALSE)
+par(mar = c(1,1,2,1) + 0.1)
+plot.phylo(tree_for_plot, type = "phylogram", direction = "right",
+           show.tip.label = TRUE, use.edge.length = FALSE, cex = 0.7, label.offset = 0.3,
+           main = "Maximum Likelihood (outgroup removed for display)")
+add.scale.bar()
+if (!is.null(tree_for_plot$node.label)) {
+  nl <- as.numeric(tree_for_plot$node.label)
+  # show only reasonably-supported (>=50) node labels to avoid clutter
+  nodes_to_show <- which(!is.na(nl) & nl >= 50) + length(tree_for_plot$tip.label)
+  if (length(nodes_to_show) > 0) nodelabels(text = nl[nl >= 50], node = nodes_to_show, frame = "n", cex = 0.6)
+}
+```
+
+# Summarize metabolic inequality across strains
+
+```{r}
+# Basic summary
+summary(map$sdlog)
+#  Min. 1st Qu.  Median    Mean 3rd Qu.    Max.    NA's 
+# 0.3559  0.4195  0.4942  0.5328  0.5601  1.1129       1 
+
+# Range
+range(map$sdlog, na.rm = TRUE)
+# 0.3559286 - 1.1128792
+
+# Mean and SD
+mean(map$sdlog, na.rm = TRUE)
+sd(map$sdlog, na.rm = TRUE)
+sem(map$sdlog, na.rm = TRUE)
+# 0.53 +/- 0.0391 => mean +/- SEM 
+
+# Quantiles (useful for legend cutoffs)
+quantile(map$sdlog, probs = c(0, 0.05, 0.25, 0.5, 0.75, 0.95, 1), na.rm = TRUE)
+
+# Histogram
+hist(map$sdlog, breaks = 20, col = "gray80", main = "Distribution of sdlog", xlab = "sdlog")
+
+# Kernel density
+
+png(filename="~/GitHub/MetabolicDistribution/output/3.kernel.png", width = 1600, 
+    height = 1200, res = 150, bg = "white")
+# margins: bottom, left, top, right (right large to avoid label clipping)
+
+par(
+  mar = c(5, 6, 3, 5),
+  mgp = c(3.8, 1.3, 0)
+)
+
+x <- map$sdlog[!is.na(map$sdlog)]
+d <- density(x)
+
+
+plot(
+  d,
+  main = "",
+  xlab = "Metabolic inequality",
+  ylab = "Density",
+  lwd  = 2.5,
+  col  = "steelblue",
+  cex.lab = 2, 
+  las  = 2,
+  xaxt = "n",
+  yaxt = "n",
+  tck  = 0,
+  ylim = c(0, 4)   # ensure y ticks 0–4 are visible
+)
+
+# filled density
+polygon(d, col = adjustcolor("steelblue", alpha.f = 0.3), border = NA)
+
+# --- compute tick locations ---
+x_at <- axTicks(1)  # default "nice" x ticks
+y_at <- 0:4         # y ticks: 0,1,2,3,4
+
+box(lwd = 2)
+
+# --- bottom and left axes (with labels) ---
+axis(1, at = x_at, cex.axis = 1.5, lwd = 2.5, lwd.ticks = 2)
+axis(2, at = y_at, las = 2, cex.axis = 1.5, lwd = 2.5, lwd.ticks = 2)
+
+axis(3, at = x_at, labels = FALSE, lwd = 2.5, lwd.ticks = 2)
+axis(4, at = y_at, labels = FALSE, lwd = 2.5, lwd.ticks = 2)
+
+# Close Plot Device
+dev.off()
+graphics.off()
+
+# Show Plot
+img <- readPNG("~/GitHub/MetabolicDistribution/output/3.kernel.png")
+
+grid.raster(img)
+
+# The distribution of estimated log-scale dispersions is right-skewed, with most samples showing moderate heterogeneity and a small number exhibiting substantially higher variability.
+```
+
+
+# Map effect sizes onto tree
+
+```{r}
+# -----------------------
+# Inputs / outputs
+# -----------------------
+tree_file <- "data/isolates/16S_GTRG.raxml.support"
+map_file  <- "data/isolates/isolate.mapping.3.csv"
+
+# -----------------------
+# 1) Read tree & mapping
+# -----------------------
+tree <- read.tree(tree_file)
+
+map <- read.csv(map_file, stringsAsFactors = FALSE) %>%
+  mutate(
+    strain = as.character(strain),
+    genus  = as.character(genus),
+    phytip = trimws(paste(genus, strain)),
+    sdlog  = as.numeric(sdlog)
+  )
+
+# -----------------------
+# 2) Relabel tips (strain -> phytip)
+# -----------------------
+strain2phy <- setNames(map$phytip, map$strain)
+hit <- tree$tip.label %in% names(strain2phy)
+tree$tip.label[hit] <- strain2phy[tree$tip.label[hit]]
+if (anyDuplicated(tree$tip.label)) tree$tip.label <- make.unique(tree$tip.label)
+
+# -----------------------
+# 3) Root on Methanosarcina
+# -----------------------
+outgroup_label <- grep("Methanosarc", tree$tip.label, value = TRUE)
+stopifnot(length(outgroup_label) == 1)
+tree <- root(tree, outgroup = outgroup_label, resolve.root = TRUE)
+
+# -----------------------
+# 4) Drop outgroup + Bacillus IUB2513
+# -----------------------
+bacillus_label <- map$phytip[map$strain == "IUB2513"]
+to_drop <- intersect(c(outgroup_label, bacillus_label), tree$tip.label)
+t_display <- if (length(to_drop) > 0) drop.tip(tree, to_drop) else tree
+t_display <- ladderize(t_display, right = FALSE)
+t_display$node.label <- NULL
+
+# -----------------------
+# 5) Build sdlog data aligned to tree
+# -----------------------
+sd_vec <- setNames(map$sdlog, map$phytip)
+sd_on_tips <- as.numeric(sd_vec[t_display$tip.label])
+
+dat <- data.frame(
+  sdlog = sd_on_tips,
+  row.names = t_display$tip.label,
+  check.names = FALSE
+)
+
+# phylo4d object (needed for table.phylo4d tree drawing)
+x <- phylo4d(t_display, tip.data = dat)
+
+# -----------------------
+# 6) Palette + FIXED legend range (0.3 -> 1.0)
+# -----------------------
+BuRd <- c("#0571B0","#92C5DE","gray92","#F7F7F7","#F4A582","#CA0020")
+pal <- colorRampPalette(BuRd)(25)
+
+legend_min <- 0.3
+legend_max <- 1.0
+
+# Map sd_on_tips to this fixed legend range (clamped inside)
+breaks_fixed <- seq(legend_min, legend_max, length.out = length(pal) + 1)
+idx_fixed <- findInterval(sd_on_tips, vec = breaks_fixed, all.inside = TRUE)
+assigned_cols <- pal[idx_fixed]
+assigned_cols[is.na(sd_on_tips)] <- "gray85"  # neutral color for any NA
+
+# -----------------------
+# 7) Plot: draw tree (hide built-in symbols) + draw one manual tile column + legend
+# -----------------------
+png(filename="~/GitHub/MetabolicDistribution/output/3.trait.map.png", width = 1600, 
+    height = 1200, res = 150, bg = "white")
+
+# margins: bottom, left, top, right (right large to avoid label clipping)
+par(mar = c(3, 4, 0.5, 3))
+
+# Draw tree via table.phylo4d but keep built-in symbol column effectively invisible:
+# (symbol must be a valid arg; we use "colors" but set cex.symbol tiny)
+table.phylo4d(
+  x,
+  treetype        = "phylogram",
+  symbol          = "colors",    # required legal value
+  show.node       = FALSE,
+  cex.label       = 0.68,
+  grid            = FALSE,
+  scale           = TRUE,
+  use.edge.length = FALSE,
+  edge.color      = "black",
+  edge.width      = 1.6,
+  box             = FALSE,
+  col             = pal,         # palette passed but builtin symbols hidden
+  pch             = 15,
+  cex.symbol      = 0.01,        # effectively hide automatic symbol column
+  font            = 1,
+  ratio.tree      = 0.40,
+  cex.legend      = 0.01,        # tiny but non-zero (avoids strwidth error)
+  center          = FALSE,
+  show.var.label  = FALSE
+)
+
+# Grab tip coordinates and overlay exactly one visible column of colored squares
+lp <- get("last_plot.phylo", envir = .PlotPhyloEnv)
+n_tip <- length(t_display$tip.label)
+tip_x <- lp$xx[1:n_tip]
+tip_y <- lp$yy[1:n_tip]
+
+# horizontal offset for manual column (tune 0.02-0.05 to preference)
+usr <- par("usr")
+offset <- 0.03 * diff(usr[1:2])
+
+# draw manual column of squares (one column only)
+points(
+  x = tip_x + offset,
+  y = tip_y,
+  pch = 15,
+  col = assigned_cols,
+  bg  = assigned_cols,
+  cex = 2.2
+)
+
+# ---------- Draw single continuous legend (visible, fixed 0.3->1.0) ----------
+usr <- par("usr")
+legend_x0 <- usr[1] + 0.30 * diff(usr[1:2])      # left in from edge
+legend_y0 <- usr[3] - 0.00 * diff(usr[3:4])      # slightly above bottom
+
+# Make the bar clearly visible
+bar_w <- diff(usr[1:2]) * 0.018
+bar_h <- diff(usr[3:4]) * 0.020
+
+for (i in seq_along(pal)) {
+  rect(
+    xleft   = legend_x0 + (i-1) * bar_w,
+    ybottom = legend_y0,
+    xright  = legend_x0 + i * bar_w,
+    ytop    = legend_y0 + bar_h,
+    col     = pal[i],
+    border  = NA
+  )
+}
+
+# three explicit tick values
+ticks <- c(0.25, 0.50, 1.0)
+
+# positions evenly spanning the color bar
+tick_x <- legend_x0 + c(0, 0.5, 1) * bar_w * (length(pal) - 1)
+
+text(
+  x      = tick_x,
+  y      = legend_y0 - 0.02 * diff(usr[3:4]),
+  labels = c("0.25", "0.63", "1.0"),
+  adj    = c(0.5, 1),
+  cex    = 1
+)
+
+# Close Plot Device
+dev.off()
+graphics.off()
+
+# Show Plot
+img <- readPNG("~/GitHub/MetabolicDistribution/output/3.trait.map.png")
+
+grid.raster(img)
+```
+
+## Phylogenetic tests
+
+```{r}
+
+# Load & root tree (your original commands)
+ml.tree <- read.tree("data/isolates/16S_GTRG.raxml.support")
+tree.rooted <- ape::root(ml.tree, outgroup = "Methanosarcina", resolve.root = TRUE)
+
+# Keep only tips present in your data (map$strain)
+tips_to_keep <- intersect(tree.rooted$tip.label, as.character(map$strain))
+tips_to_drop <- setdiff(tree.rooted$tip.label, tips_to_keep)
+if (length(tips_to_drop) > 0) {
+  message("Dropping tips not found in map$strain: ", paste(tips_to_drop, collapse = ", "))
+}
+tree <- drop.tip(tree.rooted, tips_to_drop)
+
+# Create named sdlog vector matched to tree tip labels
+# (use as.character to avoid factor pitfalls)
+sdlog_all <- setNames(as.numeric(map$sdlog), as.character(map$strain))
+sdlog_vec <- sdlog_all[match(tree$tip.label, names(sdlog_all))]
+
+# Sanity: which tips are NA (should include Methanosarcina if it's still present or any other missing)
+na_tips <- tree$tip.label[is.na(sdlog_vec)]
+if (length(na_tips) > 0) {
+  message("Dropping tips with missing sdlog (NA): ", paste(na_tips, collapse = ", "))
+  tree <- drop.tip(tree, na_tips)
+  sdlog_vec <- sdlog_vec[!is.na(sdlog_vec)]
+  # Re-match names to be safe
+  sdlog_vec <- sdlog_vec[match(tree$tip.label, names(sdlog_vec))]
+}
+
+# Final sanity check (will stop if something still wrong)
+stopifnot(length(sdlog_vec) == length(tree$tip.label))
+stopifnot(!any(is.na(sdlog_vec)))
+
+# Run tests
+K_res <- phylosig(tree, sdlog_vec, method = "K", test = TRUE)
+print(K_res)
+#Phylogenetic signal K : 0.4096 
+#P-value (based on 1000 randomizations) : 0.086 
+# Blomberg’s K is low (but weak)
+# Closely related taxa less simila than expected under strict Brownian-motion model
+
+lambda_res <- phylosig(tree, sdlog_vec, method = "lambda", test = TRUE)
+print(lambda_res)
+#Phylogenetic signal lambda : 0.999927 
+#logL(lambda) : 5.56065 
+#LR(lambda=0) : 18.9155 
+#P-value (based on LR test) : 1.36637e-05 
+# Pagel’s lambda for sdlog very close to 1. (0.9999) and highly significant. 
+# Strong phylogenetic dependence in the covariance structure of sdlog
+# Indicating strong phylogenetic structure consistent with Brownian motion.
+```
