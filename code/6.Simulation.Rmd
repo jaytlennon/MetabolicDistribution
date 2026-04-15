@@ -8,13 +8,15 @@ output: pdf_document
 geometry: margin=2.54cm
 ---
 
-Overview: Simulation model for assessing how metabolic inequality affects 
-ecosystem processes. We assume that microbial respiration is influenced
-by cellular enzyme levels according to a non-linear saturating function
-(i.e., Michaelis-Menten). With this model, we assess how, not only variance, 
-but also skew influences aggregate function, by comparing a Gaussian 
-distribution of enzyme levels to lognormal distribution with different 
-levels of sigma (standard deviation in log space)
+Overview: Simulation model to assess how metabolic inequality influences ecosystem 
+processes (i.e., respiration). We assume that microbial respiration increases 
+nonlinearly with cellular enzyme levels according to a Michaelis–Menten function. 
+Using this framework, we evaluate how distributional properties, not only variance 
+but also skew, affect aggregate function by comparing a Gaussian distribution of 
+enzyme levels to lognormal distributions with varying levels of skew (controlled 
+by sigma, the standard deviation in log space). We further examine how these effects 
+depend on the degree of nonlinearity in the response function, as determined by 
+the half-saturation constant (Km).
 
 ## Clear workspace and set directory
 
@@ -35,64 +37,96 @@ library("grid")
 ## Part 1. Set up model conditions for simulating enzymes and respiration
 
 ```{r}
-# First, set seed
+# Set seed for reproducibility in all random number generations: rnorm() and rlnorm()
 set.seed(42)
 
-# Second, Michaelis-Menten dynamics with different half-saturation constants (Km)
+# Parameters for Michaelis-Menten dynamics and different distributions
 
-# ----------------------
-# Parameters & functions
-# ----------------------
+n <- 10^6 # number of cells in sample
 
-n <- 10^6 # number of cells
-mean_norm <- 1e5 # mean of distribution
-sd_norm   <- 0.25 * mean_norm # sd of for Gaussian distribution
-Vmax <- 1 # standardized maximum respiration
-sigma_vals <- seq(0.01, 3.5, by = 0.1) # log-space sd for skew in lognormal sims
-Km_vals <- c(1e2, 1e3, 1e4, 1e5) # Km values
-colors <- c("red","darkorange","darkgreen","blue")[1:length(Km_vals)]
-f_mm <- function(x, Km, Vmax = 1) (Vmax * x) / (Km + x) # Michaelis-Menten function
+mean_norm <- 10^5 # mean enzyme level of Gaussian distribution: reference point 
+
+sd_norm   <- 0.25 * mean_norm # sd of enzyme level for Gaussian distribution: reference point
+
+Rmax <- 1 # maximum respiration rate for a cell
+
+sigma_vals <- seq(0.01, 3.5, by = 0.1) # sd for enzyme level skewness (and variance) in lognormal space
+
+Km_vals <- c(1e2, 1e3, 1e4, 1e5) # half-saturation constant (Km) values in units of enzyme level
+
+f_mm <- function(x, Km, Rmax = 1) (Rmax * x) / (Km + x) # Michaelis-Menten function
 ```
 
 ## Part 2: Simulations of respiration with Gaussian and lognormal
 
 ```{r}
-# Pull cells from a Gaussian distribution
-activity_norm <- rnorm(n, mean = mean_norm, sd = sd_norm)
+# Sample per-cell enzyme levels from a Gaussian distribution
+activity_norm <- rnorm(n, mean = mean_norm, sd = sd_norm) # 10^6 enzyme observations
 
-# Replace any negative values with very small positive ones
-activity_norm_pos <- pmax(activity_norm, 1e-12)
+# Ensure all activity values are positive (required for Michaelis-Menten)
+activity_norm_pos <- pmax(activity_norm, 10^-12) # 10^6 enzyme observations
 
-# Apply Michaelis-Menten function to Gaussian-sampled cells
-# Calculates expected (mean) community respiration 
-baseline_resp <- sapply(Km_vals, function(Km) mean(f_mm(activity_norm_pos, Km = Km, Vmax = Vmax)))
+# Apply Michaelis-Menten function to Gaussian-sampled enzyme levels
+  # Computes average per-cell respiration rate for n cells at each Km
+  # Total community respiration = [sum of individual rates] = [n * mean of individual rates]
+  # Therefore, results scale directly to aggregate (summed) respiration for fixed n:
+baseline_resp <- sapply(Km_vals, function(Km) mean(f_mm(activity_norm_pos, Km = Km, Rmax = Rmax)))
 
-# Create matrices for output of Km and sigma combinations
-resp_ratio_matrix <- matrix(NA, nrow = length(sigma_vals), ncol = length(Km_vals)) # R ratios
-Ef_lognorm_matrix <- matrix(NA, nrow = length(sigma_vals), ncol = length(Km_vals)) # mean R for lognormal
-for (k in seq_along(Km_vals)) {
-  Km <- Km_vals[k]
-  for (i in seq_along(sigma_vals)) {
-    sigma <- sigma_vals[i]  # divided by the Gaussian baseline for Km = Km_vals[k]
-    mu <- log(mean_norm) - 0.5 * sigma^2
-    # Sets lognormal’s meanlog so arithmetic (unlogged) mean of the lognormal is approximately mean_norm. 
-    # For a lognormal with parameters (meanlog = μ, sdlog = σ), the arithmetic mean is:exp(μ + σ^2/2). 
-    # Solving for μ gives μ = log(mean) − σ^2/2. 
-    # Lets you vary skew (σ) while holding arithmetic mean fixed.
-    # Preserve arithmetic mean across σ values
-    activity_lognorm <- rlnorm(n, meanlog = mu, sdlog = sigma)
-    # Draw n samples from the lognormal with parameters mu and sigma
-    # Models per-cell activity under multiplicative variability (skewed), controlling skew via sigma
-    activity_lognorm <- pmax(activity_lognorm, 1e-12)
-    # Mirrors the Gaussian clipping behavior for numerical consistency
-    mean_resp_lognorm <- mean(f_mm(activity_lognorm, Km = Km, Vmax = Vmax))
-    # Calculate average respiration across n sampled cells under the lognormal activity for current Km
+# Create empty matrices for output across Km and sigma combinations
+  
+  # Storage for the respiration bias values (I_R)
+  # Each entry = lognormal / Gaussian
+	resp_ratio_matrix <- matrix(NA, nrow = length(sigma_vals), ncol = length(Km_vals)) 
+
+	# Storage for mean per-cell respiration under the lognormal distribution
+  # These are the raw values before taking ratios
+	Ef_lognorm_matrix <- matrix(NA, nrow = length(sigma_vals), ncol = length(Km_vals))
+
+# Loop over Km and sigma to simulate respiration and calculate the index of respiration bias (I_R)
+	
+	for (k in seq_along(Km_vals)) {
+    Km <- Km_vals[k]
+    
+    for (i in seq_along(sigma_vals)) {
+      sigma <- sigma_vals[i]
+ 
+# Adjust lognormal parameters so the arithmetic mean matches the Gaussian mean as sigma changes: 
+    # meanlog (mu) = mean of log-transformed values
+    # Choose mu (meanlog) so the lognormal has arithmetic mean = mean_norm (Gaussian mean)
+    # Arithmetic mean for a lognormal: E[X] = exp(mu + sigma^2 / 2)
+    # Set equal to target mean: mean_norm = exp(mu + sigma^2 / 2)
+    # Take natural log: log(mean_norm) = mu + sigma^2 / 2
+    # Solve for mu: mu = log(mean_norm) - sigma^2 / 2
+    # This allows skew (and variance) to vary with sigma while holding the mean constant
+    # Any differences in respiration due to shape (heterogeneity), not mean enzyme activity
+    mu <- log(mean_norm) - 0.5 * sigma^2 
+
+# Sample per-cell enzyme levels from a lognormal distribution        
+    # Represents multiplicative (skewed) variability among cells
+    # Skewness and variance increase with sigma while the arithmetic mean is held constant
+    activity_lognorm <- rlnorm(n, meanlog = mu, sdlog = sigma) # 10^6 enzyme observations
+
+    # Ensure strictly positive values for numerical consistency with Gaussian case
+    # (lognormal draws are already positive)
+    activity_lognorm <- pmax(activity_lognorm, 10^-12)
+    
+# Apply Michaelis-Menten function to lognormal-sampled cells
+  # Computes mean per-cell respiration with lognormal and current Km
+  # Total community respiration = sum of individual rates = n * mean
+  # Therefore, results scale directly to aggregate (summed) respiration for fixed n
+  # Returns one value per loop iteration for the current Km-sigma combination
+    mean_resp_lognorm <- mean(f_mm(activity_lognorm, Km = Km, Rmax = Rmax))
+
+# Calculate index of respiration bias (I_R)
+  # Ratio of aggregated respiration under lognormal vs. Gaussian activity (for the same Km)
+  # Values > 1 indicate higher predicted community respiration under the lognormal case
+  # Values < 1 indicate lower predicted community respiration under the lognormal case
     resp_ratio_matrix[i, k] <- mean_resp_lognorm / baseline_resp[k]
-    # Store ratio of lognormal mean respiration to the Gaussian-baseline mean respiration for this (sigma, Km)
-    # Values >1 indicate the lognormal yields higher predicted community respiration than the Gaussian baseline (with same arithmetic mean)
-    # Values <1 indicate the lognormal yields lower predicted community respiration than the Gaussian baseline (with same arithmetic mean)
+    
+# Store mean per-cell respiration (scales to aggregate respiration via n * mean)
+# Useful for plotting absolute values or checking numerical stability    
     Ef_lognorm_matrix[i, k] <- mean_resp_lognorm
-    # Store raw mean respiration (useful for plotting in absolute units or checking numeric stability).
+    # Ef_lognorm_matrix
   }
 }
 ```
@@ -100,22 +134,22 @@ for (k in seq_along(Km_vals)) {
 ## Part 3: Make figure
 
 ```{r}
-# Respiration ratio as function of skew (sigma)
+# Index of respiration bias (I_R) as function of skew (sigma)
 # Different colored lines for different Km values
 
 png(filename="~/GitHub/MetabolicDistribution/output/6.simulation.png", width = 1600, 
     height = 1200, res = 150, bg = "white")
 
-par(mar = c(5, 6, 4, 2))
+# Plot margins
+par(mar = c(7, 9, 4, 2) + 0.1, mgp = c(4, 1, 0), lwd = 1.6)
+par(pty = "s") # square plot
 
+# Define sigma limtt for plotting
 cutoff <- 3.2
 idx <- sigma_vals <= cutoff
 
-op <- par(no.readonly = TRUE)
-on.exit(par(op), add = TRUE)
-
-par(mar = c(7, 9, 4, 2) + 0.1, mgp = c(4, 1, 0), lwd = 1.6)
-par(pty = "s")
+# Define colors
+colors <- c("red","darkorange","darkgreen","blue")[1:length(Km_vals)] # for plotting
 
 # Main plot
 plot(sigma_vals[idx], resp_ratio_matrix[idx, 1],
@@ -166,7 +200,7 @@ for (k in seq_along(Km_vals)) {
 abline(h = 1, col = "gray50", lty = 2)
 box(lwd = 1.8)
 
-# Close Plot Device
+# Close plot device
 dev.off()
 graphics.off()
 
